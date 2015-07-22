@@ -25,7 +25,6 @@ from netaddr import IPNetwork
 from libnetwork_plugin.datastore_libnetwork import LibnetworkDatastoreClient
 from pycalico.datastore_errors import DataStoreError
 from pycalico.datastore_datatypes import IF_PREFIX, Endpoint
-from pycalico.ipam import SequentialAssignment
 from pycalico import netns
 
 
@@ -314,8 +313,8 @@ def assign_ip(version):
     assert version in [4, 6]
     # For each configured pool, attempt to assign an IP before giving up.
     for pool in client.get_ip_pools(version):
-        assigner = SequentialAssignment()
-        ip = assigner.allocate(pool)
+        # TODO SJC fix.
+        ip = None
         if ip is not None:
             ip = IPNetwork(ip)
             break

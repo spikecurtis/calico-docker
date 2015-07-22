@@ -15,146 +15,373 @@
 from etcd import EtcdKeyNotFound, EtcdAlreadyExist
 
 from netaddr import IPAddress, IPNetwork
+from types import NoneType
+import socket
+import json
 
 from pycalico.datastore_datatypes import IPPool
 from pycalico.datastore import CALICO_V_PATH, DatastoreClient, handle_errors
+from pycalico.block import (AllocationBlock,
+                            get_block_id_for_address,
+                            BLOCK_PREFIXLEN)
 
-IP_VERSION_PATH = CALICO_V_PATH + "/ipam/v%(version)s"
-IP_ASSIGNMENT_PATH = IP_VERSION_PATH + "/assignment/%(pool)s"
-IP_ASSIGNMENT_KEY = IP_ASSIGNMENT_PATH + "/%(address)s"
+IPAM_V_PATH = "/calico/ipam/v1/"
+IPAM_HOST_PATH = IPAM_V_PATH + "host/%(hostname)s/"
+IPAM_HOST_AFFINITY_PATH = IPAM_HOST_PATH + "ipv%(version)d/block/"
+
+my_hostname = socket.gethostname()
 
 
-class SequentialAssignment(object):
+class BlockReaderWriter(DatastoreClient):
     """
-    Assign IP addresses sequentially
+    Can read and write allocation blocks to the data store, as well as related
+    bits of state.
+
+    This class keeps etcd specific code from being in the main IPAMClient
+    class.
     """
 
-    def __init__(self):
-        # Init an etcd client.
-        self.etcd = IPAMClient()
-
-    def allocate(self, pool):
+    def _read_block(self, block_id):
         """
-        Attempt to allocate an IP address from the provided pool.
-
-        :param IPPool or IPNetwork pool: The pool to allocate from
-        :return: An IP address which has been allocated or None
-        if allocation failed.
-        :rtype str:
+        Read the block from the data store.
+        :param block_id: The CIDR identifier for a block.
+        :return: An AllocationBlock object
         """
-        if isinstance(pool, IPPool):
-            pool = pool.cidr
-        assert isinstance(pool, IPNetwork)
+        key = _datastore_key(block_id)
+        try:
+            result = self.etcd_client.read(key)
+        except EtcdKeyNotFound:
+            raise KeyError(block_id)
+        block = AllocationBlock.from_etcd_result(result)
+        return block
+
+    def _compare_and_swap_block(self, block):
+        """
+        Write the block using an atomic Compare-and-swap.
+        """
+
+        # If the block has a db_result, CAS against that.
+        if block.db_result is not None:
+            try:
+                self.etcd_client.update(block.update_result())
+            except EtcdAlreadyExist:
+                raise CASError(block.get_block_id())
+        else:
+            # Block is new.  Write it with prevExist=False
+            key = _datastore_key(block.get_block_id())
+            value = block.to_json()
+            try:
+                self.etcd_client.write(key, value, prevExist=False)
+            except EtcdAlreadyExist:
+                raise CASError(block.get_block_id())
+
+    def _get_affine_blocks(self, host, version, pool):
+        """
+        Get the blocks for which this host has affinity.
+
+        :param host: The host name to get affinity for.
+        :param version: 4 for IPv4, 6 for IPv6.
+        :param pool: Limit blocks to a specific pool, or pass None to find all
+        blocks for the specified version.
+        """
+        # Construct the path
+        path = IPAM_HOST_AFFINITY_PATH % {"hostname": host,
+                                          "version": version}
+        block_ids = []
+        try:
+            result = self.etcd_client.read(path).children
+            for child in result:
+                packed = child.key.split("/")
+                if len(packed) == 9:
+                    # block_ids are encoded 192.168.1.0/24 -> 192.168.1.0-24
+                    # in etcd.
+                    block_ids.append(packed[8].replace("-", "/"))
+        except EtcdKeyNotFound:
+            # Means the path is empty.
+            pass
+
+        # If pool specified, filter to only include ones in the pool.
+        if pool is not None:
+            assert isinstance(pool, IPPool)
+            block_ids = [cidr for cidr in block_ids if IPNetwork(cidr) in pool]
+
+        return block_ids
+
+    def _new_affine_block(self, host, version, pool):
+        """
+        Create an register a new affine block for the host.
+
+        :param host: The host name to get a block for.
+        :param version: 4 for IPv4, 6 for IPv6.
+        :param pool: Limit blocks to a specific pool, or pass None to find all
+        blocks for the specified version.
+        :return: The block-id of the new block.
+        """
+        # Get the pools and verify we got a valid one, or none.
+        ip_pools = self.get_ip_pools(version)
+        if pool is not None:
+            if pool not in ip_pools:
+                raise ValueError("Requested pool %s is not configured or has"
+                                 "wrong attributes" % pool)
+            # Confine search to only the one pool.
+            ip_pools = [pool]
+
+        for pool in ip_pools:
+            for block_cidr in pool.subnet(BLOCK_PREFIXLEN(version)):
+                # Try them in order until we find a free one
+                block_id = str(block_cidr)
+                key = _datastore_key(block_id)
+                try:
+                    _ = self.etcd_client.read(key)
+                except EtcdKeyNotFound:
+                    # Found a free block.  Store it's ours.
+                    try:
+                        self._claim_block_affinity(host, block_cidr)
+                    except KeyError:
+                        # Failed to claim the block because some other host
+                        # has it.
+                        continue
+                    # Success!
+                    return block_id
+        raise NoFreeBlocksError()
+
+    def _claim_block_affinity(self, host, block_cidr):
+        """
+        Claim a block we think is free.
+        """
+        block_id = str(block_cidr)
+        path = IPAM_HOST_AFFINITY_PATH % {"hostname": host,
+                                          "version": block_cidr.version}
+        key = path + block_id.replace("/", "-")
+        self.etcd_client.write(key, "")
+
+        # Create the block.
+        block = AllocationBlock(block_cidr, host)
+        try:
+            self._compare_and_swap_block(block)
+        except CASError:
+            # Block exists.  Read it back to find out its host affinity
+            block = self._read_block(block_id)
+            if block.host_affinity == host:
+                # Block is now claimed by us.  Some other process on this host
+                # must have claimed it.
+                return
+
+            # Some other host beat us to claiming this block.  Clean up.
+            self.etcd_client.delete(key)
+
+            # Throw a key error to let the caller know the block wasn't free
+            # after all.
+
+            raise KeyError(block_id)
+        # successfully created the block.  Done.
+        return
+
+
+class CASError(Exception):
+    """
+    Compare-and-swap atomic update failed.
+    """
+    pass
+
+class NoFreeBlocksError(Exception):
+    """
+    Tried to get a new block but there are none available.
+    """
+    pass
+
+def _datastore_key(block_id):
+    """
+    Translate a block_id into a datastore key.
+    :param block_id:
+    :return:
+    """
+    return "FAKE"
+
+
+class IPAMClient(BlockReaderWriter):
+
+    def auto_assign(self, num_v4, num_v6, primary_key, attributes, pool=(None, None)):
+        """
+        Automatically pick and assign the given number of IPv4 and IPv6 addresses.
+
+        :param num_v4: Number of IPv4 addresses to request
+        :param num_v6: Number of IPv6 addresses to request
+        :param primary_key: allocation primary key for this request.  You can query
+        this key using get_assignments_by_key() or release all addresses with
+        this key using release_by_key().
+        :param attributes: Contents of this dict will be stored with the
+        assignment and can be queried using get_assignment_attributes().  Must be
+        JSON serializable.
+        :param pool: (optional) tuple of (v4 pool, v6 pool); if supplied, the
+        pool(s) to assign from,  If None, automatically choose a pool.
+        :return: A tuple of (v4_address_list, v6_address_list).  When IPs in
+        configured pools are at or near exhaustion, this method may return
+        fewer than requested addresses.
+        """
+
+        v4_address_list = self._auto_assign(4, num_v4, primary_key,
+                                            attributes, pool[0])
+        v6_address_list = self._auto_assign(6, num_v6, primary_key,
+                                            attributes, pool[1])
+        return v4_address_list, v6_address_list
+
+    def _auto_assign(self, ip_version, num, primary_key, attributes, pool):
+
+        block_ids = iter(self._get_affine_blocks(my_hostname, ip_version, pool))
+        allocated_ips = []
+
+        num_remaining = num
+        while num_remaining > 0:
+            try:
+                block_id = block_ids.next()
+            except StopIteration:
+                break
+            ips = self._auto_assign_block(block_id,
+                                          num_remaining,
+                                          primary_key,
+                                          attributes)
+            allocated_ips.extend(ips)
+            num_remaining = num - len(allocated_ips)
+
+        # If there are still addresses to allocate, then we've run out of
+        # blocks with affinity.  Try to fullfil address request by allocating
+        # new blocks.
+        while num_remaining > 0:
+            try:
+                new_block = self._new_affine_block(my_hostname,
+                                                   ip_version,
+                                                   pool)
+                # If successful, this creates the block and registers it to us.
+            except NoFreeBlocksError:
+                # No more blocks.
+                break
+            ips = self._auto_assign_block(new_block,
+                                          num_remaining,
+                                          primary_key,
+                                          attributes)
+            allocated_ips.extend(ips)
+            num_remaining = num - len(allocated_ips)
+
+        return allocated_ips
+
+    def _auto_assign_block(self, block_id, num, primary_key, attributes):
+        """
+        Automatically pic IPs from a block and commit them to the data store.
+
+        :param block_id: The identifier for the block to read.
+        :param num: The number of IPs to assign.
+        :param primary_key: allocation primary key for this request.
+        :param attributes: Contents of this dict will be stored with the
+        assignment and can be queried using get_assignment_attributes().  Must be
+        JSON serializable.
+        :return: List of assigned IPs.
+        """
+        ips = []
+        while not ips:
+            block = self._read_block(block_id)
+            unconfirmed_ips = block.auto_assign(num=num,
+                                                primary_key=primary_key,
+                                                attributes=attributes)
+            if len(unconfirmed_ips) == 0:
+                # Block is full.
+                break
+            try:
+                self._compare_and_swap_block(block)
+            except CASError:
+                continue
+            else:
+                # Confirm the IPs.
+                ips = unconfirmed_ips
+        return ips
+
+    def assign(self, address, primary_key, attributes):
+        """
+        Assign the given address.  Throws AlreadyAssignedError if the address is
+        taken.
+
+        :param address: IPAddress to assign.
+        :param primary_key: allocation primary key for this request.  You can query
+        this key using get_assignments_by_key() or release all addresses with
+        this key using release_by_key().
+        :param attributes: Contents of this dict will be stored with the
+        assignment and can be queried using get_assignment_attributes().  Must be
+        JSON serializable.
+        :return: None.
+        """
+        assert isinstance(address, IPAddress)
+        block_id = get_block_id_for_address(address)
 
         while True:
-            assigned_addresses = self.etcd.get_assigned_addresses(pool)
+            try:
+                block = self._read_block(block_id)
+            except KeyError:
+                # Block doesn't exist.  Is it in a valid pool?
+                pools = self.get_ip_pools(address.version)
+                if any([address in pool for pool in pools]):
+                    # Address is in a pool.  Create and claim the block.
+                    try:
+                        self._claim_block_affinity(my_hostname,
+                                                   IPNetwork(block_id))
+                    except KeyError:
+                        # Happens if something else claims the block between
+                        # the read above and claiming it.
+                        continue
+                    # Block exists now, retry writing to it.
+                    continue
+                else:
+                    raise ValueError("%s is not in any configured pool" %
+                                     address)
 
-            candidate_address = self._get_next(pool, assigned_addresses)
-            if candidate_address is None:
-                # the pool is full, we can't allocate an address
-                return None
-            else:
-                # We've found an address to try.
-                if self.etcd.assign_address(pool,
-                                            IPAddress(candidate_address)):
-                    return candidate_address
+            # Try to assign.  Throws exception if already assigned -- let it.
+            block.assign(address, primary_key, attributes)
 
-    def _get_next(self, pool, assigned):
+            # Try to commit
+            try:
+                self._compare_and_swap_block(block)
+                break  # Success!
+            except CASError:
+                continue
+
+    def release(self, addresses):
         """
-        Gets the next address in a range.
-        :param IPNetwork pool: The pool to allocate from
-        :param assigned: a dict of addresses that are already assigned.
-        :return: the next IP address to try (a string), or None if the pool
-                 is full.
+        Release the given addresses.
+
+        :param addresses: List of IPAddresses to release (ok to mix IPv4 and IPv6).
+        :return: None.
         """
-        assert isinstance(pool, IPNetwork)
-        for addr in pool.iter_hosts():
-            addr_string = str(addr)
-            if addr_string not in assigned:
-                return addr_string
-        return None
 
-
-class IPAMClient(DatastoreClient):
-
-    @handle_errors
-    def assign_address(self, pool, address):
+    def get_assignments_by_key(self, primary_key):
         """
-        Attempt to assign an IPAddress in a pool.
-        Fails if the address is already assigned.
-        The directory for storing assignments in this pool must already exist.
-
-        :param IPPool or IPNetwork pool: The pool that the assignment is from.
-        :param IPAddress address: The address to assign.
-
-        :return: True if the allocation succeeds, false otherwise. An
-        exception is thrown for any error conditions.
-        :rtype: bool
+        Return a list of IPAddresses assigned to the key.
+        :param primary_key: Key to query e.g. used on assign() or auto_assign().
+        :return: List of IPAddresses
         """
-        if isinstance(pool, IPPool):
-            pool = pool.cidr
-        assert isinstance(pool, IPNetwork)
-        assert isinstance(address, IPAddress)
 
-        key = IP_ASSIGNMENT_KEY % {"version": pool.version,
-                                   "pool": str(pool).replace("/", "-"),
-                                   "address": address}
-        try:
-            self.etcd_client.write(key, "", prevExist=False)
-        except EtcdAlreadyExist:
-            return False
-        else:
-            return True
-
-    @handle_errors
-    def unassign_address(self, pool, address):
+    def release_by_key(self, primary_key):
         """
-        Unassign an IP from a pool.
+        Release all addresses assigned to the key.
 
-        :param IPPool or IPNetwork pool: The pool that the assignment is from.
-        :param IPAddress address: The address to unassign.
-
-        :return: True if the address was unassigned, false otherwise. An
-        exception is thrown for any error conditions.
-        :rtype: bool
+        :param primary_key:
+        :return: None.
         """
-        if isinstance(pool, IPPool):
-            pool = pool.cidr
-        assert isinstance(pool, IPNetwork)
-        assert isinstance(address, IPAddress)
 
-        key = IP_ASSIGNMENT_KEY % {"version": pool.version,
-                                   "pool": str(pool).replace("/", "-"),
-                                   "address": address}
-        try:
-            self.etcd_client.delete(key)
-        except EtcdKeyNotFound:
-            return False
-        else:
-            return True
-
-    @handle_errors
-    def get_assigned_addresses(self, pool):
+    def get_assignment_attributes(self, address):
         """
-        :param IPPool or IPNetwork pool: The pool to get assignments for.
-        :return: The assigned addresses from the pool
-        :rtype dict of [str, str]
-        """
-        if isinstance(pool, IPPool):
-            pool = pool.cidr
-        assert isinstance(pool, IPNetwork)
+        Return the attributes of a given address.
 
-        directory = IP_ASSIGNMENT_PATH % {"version": pool.version,
-                                          "pool": str(pool).replace("/", "-")}
-        try:
-            nodes = self.etcd_client.read(directory).children
-        except EtcdKeyNotFound:
-            # Path doesn't exist so configure now.
-            self.etcd_client.write(directory, None, dir=True)
-            return {}
-        else:
-            addresses = {}
-            for child in nodes:
-                if not child.dir:
-                    addresses[child.key.split("/")[-1]] = ""
-            return addresses
+        :param address: IPAddress to query.
+        :return: The attributes for the address as passed to auto_assign() or
+        assign().
+        """
+
+
+    """
+    Hosts automatically register themselves as the owner of a block the
+    first time they request an auto-assigned IP.  For auto-assignment, a
+    host will allocate from a block it owns, or if all their currently owned blocks get
+    full, it will register itself as the owner of a new block.  If all blocks
+    are owned, and all the host's own blocks are full, it will pick blocks at
+    random until it can fulfil the request.  If you're really, really out of
+    addresses, it will fail the request.
+    """
